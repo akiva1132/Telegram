@@ -659,6 +659,14 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
     private DrawerProfileCell.AnimatedStatusView animatedStatusView;
     public RightSlidingDialogContainer rightSlidingDialogContainer;
 
+    public static final HashSet<Long> allowedChats = new HashSet<>();
+
+    static {
+        // בעתיד, תוכל להוסיף כאן את המזהים המורשים, לדוגמה:
+        allowedChats.add(-100123456789L); // מזהה של ערוץ לדוגמה
+        // allowedChats.add(-100987654321L); // מזהה של קבוצה לדוגמה
+    }
+
     public final Property<DialogsActivity, Float> SCROLL_Y = new AnimationProperties.FloatProperty<DialogsActivity>("animationValue") {
         @Override
         public void setValue(DialogsActivity object, float value) {
@@ -7925,6 +7933,8 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         boolean isGlobalSearch = false;
         int folderId = 0;
         int filterId = 0;
+
+        // קטע זה, שאוסף מידע על הפריט שנלחץ, נשאר ללא שינוי
         if (adapter instanceof DialogsAdapter) {
             DialogsAdapter dialogsAdapter = (DialogsAdapter) adapter;
             int dialogsType = dialogsAdapter.getDialogsType();
@@ -8030,7 +8040,6 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                 } else if (!str.equals("section")) {
                     NewContactBottomSheet activity = new NewContactBottomSheet(DialogsActivity.this, getContext());
                     activity.setInitialPhoneNumber(str, true);
-//                    presentFragment(activity);
                     activity.show();
                 }
             } else if (obj instanceof ContactsController.Contact) {
@@ -8053,6 +8062,30 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             return;
         }
 
+        // --- התחלת קוד החסימה לתוצאות חיפוש ---
+        if (searchViewPager != null && adapter == searchViewPager.dialogsSearchAdapter) {
+            boolean isAllowed = false;
+
+            // בדוק אם זה צ'אט עם משתמש (ולא בוט)
+            if (DialogObject.isUserDialog(dialogId)) {
+                TLRPC.User user = getMessagesController().getUser(dialogId);
+                if (user != null && !user.bot) {
+                    isAllowed = true;
+                }
+            }
+            // בדוק אם זה ערוץ/קבוצה מהרשימה הלבנה
+            else if (allowedChats.contains(dialogId)) {
+                isAllowed = true;
+            }
+
+            // אם הצ'אט אינו מורשה - סיים את הפונקציה כאן ומנע את פתיחתו
+            if (!isAllowed) {
+                return;
+            }
+        }
+        // --- סוף קוד החסימה ---
+
+        // קוד זה, שמטפל בפתיחת הצ'אט, יתבצע רק אם הקליק עבר את בדיקת החסימה
         if (onlySelect) {
             if (!validateSlowModeDialog(dialogId)) {
                 return;
@@ -8167,7 +8200,6 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                             args.putBoolean("isSubscriberSuggestions", !ChatObject.canManageMonoForum(currentAccount, chat));
 
                             ChatActivity activity = new ChatActivity(args);
-//                            ForumUtilities.applyTopic(activity, MessagesStorage.TopicKey.of(-chat.id, getMessagesController().getForumLastTopicId(chat.id)));
                             presentFragment(highlightFoundQuote(activity, msg));
                         } else if (ChatObject.areTabsEnabled(chat)) {
                             ChatActivity activity = new ChatActivity(args);
@@ -11040,9 +11072,34 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             return frozenDialogsList;
         }
         MessagesController messagesController = AccountInstance.getInstance(currentAccount).getMessagesController();
+
+        // סינון רשימת הצ'אטים הראשית (All Chats)
         if (dialogsType == DIALOGS_TYPE_DEFAULT) {
-            return messagesController.getDialogs(folderId);
-        } else if (dialogsType == DIALOGS_TYPE_WIDGET || dialogsType == DIALOGS_TYPE_IMPORT_HISTORY) {
+            ArrayList<TLRPC.Dialog> originalDialogs = messagesController.getDialogs(folderId);
+            ArrayList<TLRPC.Dialog> filteredDialogs = new ArrayList<>();
+
+            for (TLRPC.Dialog dialog : originalDialogs) {
+                long dialogId = dialog.id;
+
+                // בדיקה האם זהו צ'אט עם משתמש
+                if (DialogObject.isUserDialog(dialogId)) {
+                    // <<< תוספת: בדיקה שהמשתמש הוא לא בוט >>>
+                    TLRPC.User user = messagesController.getUser(dialogId);
+                    if (user != null && !user.bot) {
+                        filteredDialogs.add(dialog); // הוסף רק אם זה לא בוט
+                    }
+                    continue; // המשך לצ'אט הבא
+                }
+
+                // תמיד הצג את תיקיית הארכיון או צ'אטים מהרשימה הלבנה
+                if (dialog instanceof TLRPC.TL_dialogFolder || allowedChats.contains(dialogId)) {
+                    filteredDialogs.add(dialog);
+                }
+            }
+            return filteredDialogs;
+        }
+
+        else if (dialogsType == DIALOGS_TYPE_WIDGET || dialogsType == DIALOGS_TYPE_IMPORT_HISTORY) {
             return messagesController.dialogsServerOnly;
         } else if (dialogsType == DIALOGS_TYPE_ADD_USERS_TO) {
             ArrayList<TLRPC.Dialog> dialogs = new ArrayList<>(messagesController.dialogsCanAddUsers.size() + messagesController.dialogsMyChannels.size() + messagesController.dialogsMyGroups.size() + 2);
@@ -11078,17 +11135,54 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             return messagesController.dialogsChannelsOnly;
         } else if (dialogsType == DIALOGS_TYPE_GROUPS_ONLY || dialogsType == DIALOGS_TYPE_IMPORT_HISTORY_GROUPS) {
             return messagesController.dialogsGroupsOnly;
-        } else if (dialogsType == 7 || dialogsType == 8) {
+        }
+
+        // סינון רשימת הצ'אטים בתוך תיקיות (Folders)
+        else if (dialogsType == 7 || dialogsType == 8) {
             MessagesController.DialogFilter dialogFilter = messagesController.selectedDialogFilter[dialogsType == 7 ? 0 : 1];
             if (dialogFilter == null) {
-                return messagesController.getDialogs(folderId);
+                // מקרה קצה - אם אין פילטר, החל את הסינון הראשי
+                ArrayList<TLRPC.Dialog> originalDialogs = messagesController.getDialogs(folderId);
+                ArrayList<TLRPC.Dialog> filteredDialogs = new ArrayList<>();
+                for (TLRPC.Dialog dialog : originalDialogs) {
+                    long dialogId = dialog.id;
+                    if (DialogObject.isUserDialog(dialogId)) {
+                        // <<< תוספת: בדיקה שהמשתמש הוא לא בוט >>>
+                        TLRPC.User user = messagesController.getUser(dialogId);
+                        if (user != null && !user.bot) {
+                            filteredDialogs.add(dialog);
+                        }
+                    } else if (dialog instanceof TLRPC.TL_dialogFolder || allowedChats.contains(dialogId)) {
+                        filteredDialogs.add(dialog);
+                    }
+                }
+                return filteredDialogs;
             } else {
+                // אל תסנן את מסך העברת ההודעות
                 if (initialDialogsType == DIALOGS_TYPE_FORWARD) {
                     return dialogFilter.dialogsForward;
                 }
-                return dialogFilter.dialogs;
+
+                // סנן את הרשימה המקורית מהתיקייה
+                ArrayList<TLRPC.Dialog> originalDialogs = dialogFilter.dialogs;
+                ArrayList<TLRPC.Dialog> filteredDialogs = new ArrayList<>();
+                for (TLRPC.Dialog dialog : originalDialogs) {
+                    long dialogId = dialog.id;
+                    if (DialogObject.isUserDialog(dialogId)) {
+                        // <<< תוספת: בדיקה שהמשתמש הוא לא בוט >>>
+                        TLRPC.User user = messagesController.getUser(dialogId);
+                        if (user != null && !user.bot) {
+                            filteredDialogs.add(dialog);
+                        }
+                    } else if (dialog instanceof TLRPC.TL_dialogFolder || allowedChats.contains(dialogId)) {
+                        filteredDialogs.add(dialog);
+                    }
+                }
+                return filteredDialogs; // החזר את הרשימה המסוננת עבור התיקייה
             }
-        } else if (dialogsType == DIALOGS_TYPE_BLOCK) {
+        }
+
+        else if (dialogsType == DIALOGS_TYPE_BLOCK) {
             return messagesController.dialogsForBlock;
         } else if (dialogsType == DIALOGS_TYPE_BOT_SHARE || dialogsType == DIALOGS_TYPE_BOT_SELECT_VERIFY || dialogsType == DIALOGS_TYPE_START_ATTACH_BOT) {
             if (botShareDialogs != null) {
@@ -11153,7 +11247,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                 ConcurrentHashMap<Long, TLRPC.Chat> chats = messagesController.getChats();
                 ArrayList<TLRPC.Dialog> sourceDialogs = requestPeerType instanceof TLRPC.TL_requestPeerTypeChat ? messagesController.dialogsGroupsOnly : messagesController.dialogsChannelsOnly;
                 for (TLRPC.Dialog dialog : sourceDialogs) {
-                    TLRPC.Chat chat = getMessagesController().getChat(-dialog.id);
+                    TLRPC.Chat chat = messagesController.getChat(-dialog.id);
                     if (meetRequestPeerRequirements(bot, chat)) {
                         dialogs.add(dialog);
                     }
@@ -12761,15 +12855,15 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         boolean onlySelfStories = !isArchive() && getStoriesController().hasOnlySelfStories();
         boolean newVisibility;
         if (isArchive()) {
-            newVisibility = !getStoriesController().getHiddenList().isEmpty();
+            newVisibility = false;
         } else {
-            newVisibility = !onlySelfStories && getStoriesController().hasStories();
+            newVisibility = false;
             onlySelfStories = getStoriesController().hasOnlySelfStories();
         }
 
-        hasOnlySlefStories = onlySelfStories;
+        hasOnlySlefStories = false;
 
-        boolean oldStoriesCellVisibility = dialogStoriesCellVisible;
+        boolean oldStoriesCellVisibility = false;
         dialogStoriesCellVisible = onlySelfStories || newVisibility;
 
         if (newVisibility || dialogStoriesCellVisible) {

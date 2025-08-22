@@ -282,26 +282,67 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
         }
     }
 
-    private boolean filter(Object obj) {
-        if (dialogsType != DialogsActivity.DIALOGS_TYPE_START_ATTACH_BOT) {
+    private boolean filter(Object object) {
+        // --- שמירה על הלוגיקה המקורית עבור המקרה הספציפי של בחירת בוט ---
+        if (dialogsType == DialogsActivity.DIALOGS_TYPE_START_ATTACH_BOT) {
+            if (object instanceof TLRPC.User) {
+                if (((TLRPC.User) object).bot) {
+                    return dialogsActivity.allowBots;
+                }
+                return dialogsActivity.allowUsers;
+            } else if (object instanceof TLRPC.Chat) {
+                TLRPC.Chat chat = (TLRPC.Chat) object;
+                if (ChatObject.isChannel(chat)) {
+                    return dialogsActivity.allowChannels;
+                } else if (ChatObject.isMegagroup(chat)) {
+                    return dialogsActivity.allowGroups || dialogsActivity.allowMegagroups;
+                } else {
+                    return dialogsActivity.allowGroups || dialogsActivity.allowLegacyGroups;
+                }
+            }
+            return false;
+        }
+
+        // --- התחלת לוגיקת הסינון הגלובלית שלנו ---
+
+        // 1. בדיקה האם האובייקט הוא בכלל מסוג שאנחנו יכולים לעבוד איתו.
+        // אם הוא לא TLObject, אנחנו לא יודעים מה לעשות איתו, אז נאפשר לו לעבור כברירת מחדל.
+        if (!(object instanceof TLObject)) {
             return true;
         }
-        // add more filters if needed
-        if (obj instanceof TLRPC.User) {
-            if (((TLRPC.User) obj).bot) {
-                return dialogsActivity.allowBots;
-            }
-            return dialogsActivity.allowUsers;
-        } else if (obj instanceof TLRPC.Chat) {
-            TLRPC.Chat chat = (TLRPC.Chat) obj;
-            if (ChatObject.isChannel(chat)) {
-                return dialogsActivity.allowChannels;
-            } else if (ChatObject.isMegagroup(chat)) {
-                return dialogsActivity.allowGroups || dialogsActivity.allowMegagroups;
-            } else {
-                return dialogsActivity.allowGroups || dialogsActivity.allowLegacyGroups;
-            }
+
+        // 2. כעת, אחרי שווידאנו שזה TLObject, אפשר בבטחה להמיר אותו ולהחיל את הלוגיקה שלנו.
+        TLObject tlObject = (TLObject) object;
+
+        if (tlObject == null) {
+            return false;
         }
+
+        long dialogId = 0;
+        boolean isUser = false;
+        boolean isBot = false;
+
+        // זהה את סוג התוצאה
+        if (tlObject instanceof TLRPC.User) {
+            TLRPC.User user = (TLRPC.User) tlObject;
+            dialogId = user.id;
+            isUser = true;
+            isBot = user.bot;
+        } else if (tlObject instanceof TLRPC.Chat) {
+            dialogId = -((TLRPC.Chat) tlObject).id;
+        } else if (tlObject instanceof TLRPC.EncryptedChat) {
+            // צ'אט מוצפן הוא תמיד עם משתמש, אז הוא תמיד מורשה
+            return true;
+        }
+
+        // הכלל: הצג את התוצאה רק אם היא עומדת באחד התנאים הבאים:
+        // 1. זהו משתמש (isUser) והוא אינו בוט (!isBot).
+        // 2. זהו צ'אט (קבוצה/ערוץ) שהמזהה שלו נמצא ברשימה הלבנה שלנו.
+        if ((isUser && !isBot) || DialogsActivity.allowedChats.contains(dialogId)) {
+            return true; // החזר 'אמת' - הצג את התוצאה
+        }
+
+        // אם אף אחד מהתנאים לא התקיים, הסתר את התוצאה
         return false;
     }
 
@@ -431,10 +472,11 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
         final int currentReqId = ++lastForumReqId;
         reqForumId = ConnectionsManager.getInstance(currentAccount).sendRequest(req, (response, error) -> {
             final ArrayList<MessageObject> messageObjects = new ArrayList<>();
+            // --- שינוי 1: המפות הוגדרו כאן כדי להיות זמינות ב-Runnable ---
+            final LongSparseArray<TLRPC.Chat> chatsMap = new LongSparseArray<>();
+            final LongSparseArray<TLRPC.User> usersMap = new LongSparseArray<>();
             if (error == null) {
                 TLRPC.messages_Messages res = (TLRPC.messages_Messages) response;
-                LongSparseArray<TLRPC.Chat> chatsMap = new LongSparseArray<>();
-                LongSparseArray<TLRPC.User> usersMap = new LongSparseArray<>();
                 for (int a = 0; a < res.chats.size(); a++) {
                     TLRPC.Chat chat = res.chats.get(a);
                     chatsMap.put(chat.id, chat);
@@ -465,6 +507,21 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
                         nextSearchRate = res.next_rate;
                         for (int a = 0; a < res.messages.size(); a++) {
                             TLRPC.Message message = res.messages.get(a);
+
+                            // --- שינוי 2: הוספת לוגיקת הסינון ---
+                            long msgDialogId = MessageObject.getDialogId(message);
+                            TLObject peerObject = null;
+                            if (DialogObject.isUserDialog(msgDialogId)) {
+                                peerObject = usersMap.get(msgDialogId);
+                            } else {
+                                peerObject = chatsMap.get(-msgDialogId);
+                            }
+
+                            if (peerObject == null || !filter(peerObject)) {
+                                continue; // דלג על תוצאה זו אם היא לא עוברת את הסינון
+                            }
+                            // --- סוף קוד הסינון ---
+
                             long did = MessageObject.getDialogId(message);
                             int maxId = MessagesController.getInstance(currentAccount).deletedHistory.get(did);
                             if (maxId != 0 && message.id <= maxId) {
@@ -576,10 +633,11 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
         final int currentReqId = lastReqId;
         reqId = ConnectionsManager.getInstance(currentAccount).sendRequest(req, (response, error) -> {
             final ArrayList<MessageObject> messageObjects = new ArrayList<>();
+            // --- שינוי 1: המפות הוגדרו כאן כדי להיות זמינות ב-Runnable done ---
+            final LongSparseArray<TLRPC.Chat> chatsMap = new LongSparseArray<>();
+            final LongSparseArray<TLRPC.User> usersMap = new LongSparseArray<>();
             if (error == null) {
                 TLRPC.messages_Messages res = (TLRPC.messages_Messages) response;
-                LongSparseArray<TLRPC.Chat> chatsMap = new LongSparseArray<>();
-                LongSparseArray<TLRPC.User> usersMap = new LongSparseArray<>();
                 for (int a = 0; a < res.chats.size(); a++) {
                     TLRPC.Chat chat = res.chats.get(a);
                     chatsMap.put(chat.id, chat);
@@ -628,6 +686,21 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
                             if (maxId != 0 && message.id <= maxId) {
                                 continue;
                             }
+
+                            // --- שינוי 2: הוספת לוגיקת הסינון ---
+                            long dialogId = MessageObject.getDialogId(message);
+                            TLObject peerObject = null;
+                            if (DialogObject.isUserDialog(dialogId)) {
+                                peerObject = usersMap.get(dialogId);
+                            } else {
+                                peerObject = chatsMap.get(-dialogId);
+                            }
+
+                            if (peerObject == null || !filter(peerObject)) {
+                                continue; // דלג על תוצאה זו אם היא לא עוברת את הסינון
+                            }
+                            // --- סוף קוד הסינון ---
+
                             MessageObject msg = messageObjects.get(a);
                             if (!searchForumResultMessages.isEmpty()) {
                                 boolean foundDuplicate = false;
